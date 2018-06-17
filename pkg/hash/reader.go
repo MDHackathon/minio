@@ -146,3 +146,7 @@ func (r *Reader) Verify() error {
 	}
 	return nil
 }
+
+func (r *Reader) Close() error {
+	return nil
+}

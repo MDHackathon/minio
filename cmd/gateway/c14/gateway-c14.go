@@ -21,21 +21,15 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"strings"
-	//	"text/tabwriter"
 	"time"
 
 	"github.com/apex/log"
 
 	"github.com/dustin/go-humanize"
-	"github.com/kr/fs"
 	"github.com/minio/cli"
 
 	"github.com/juju/errors"
 
-	"github.com/docker/docker/pkg/progress"
-	"github.com/docker/docker/pkg/streamformatter"
 	minio "github.com/minio/minio/cmd"
 	"github.com/minio/minio/cmd/logger"
 
@@ -44,7 +38,6 @@ import (
 	"github.com/online-net/c14-cli/pkg/api"
 	"github.com/online-net/c14-cli/pkg/client"
 	"github.com/online-net/c14-cli/pkg/utils/ssh"
-	"github.com/pkg/sftp"
 )
 
 const (
@@ -294,49 +287,50 @@ func (r *c14Objects) DeleteBucket(ctx context.Context, bucket string) (err error
 // ListObjects lists	 all blobs in S3 bucket filtered by prefix
 func (l *c14Objects) ListObjects(ctx context.Context, archive string, prefix string, marker string, delimiter string, maxKeys int) (loi minio.ListObjectsInfo, err error) {
 	fmt.Println("Inside list object")
+
 	var (
-	//	safe api.OnlineGetSafe
-	//bucket api.OnlineGetBucket
-	//sftpCred    sshUtils.Credentials
-	//sftpConn    *sftp.Client
-	//	uuidArchive string
+		sftpCred sshUtils.Credentials
 	)
 
-	//if safe, uuidArchive, err = l.Client.FindSafeUUIDFromArchive(archive, true); err != nil {
-	//	if safe, uuidArchive, err = l.Client.FindSafeUUIDFromArchive(archive, false); err != nil {
-	//		return
-	//	}
-	//}
-	//if bucket, err = l.Client.GetBucket(safe.UUIDRef, uuidArchive); err != nil {
-	//	return
-	//}
-	//	sftpCred.Host = strings.Split(bucket.Credentials[0].URI, "@")[1]
-	//	sftpCred.Password = bucket.Credentials[0].Password
-	//	sftpCred.User = bucket.Credentials[0].Login
-	//	if sftpConn, err = sftpCred.NewSFTPClient(); err != nil {
-	//		return
-	//	}
-	//	defer sftpCred.Close()
-	//	defer sftpConn.Close()
-	//	walker := sftpConn.Walk("/buffer")
-	//	w := tabwriter.NewWriter(os.Stdout, 20, 1, 3, ' ', 0)
-	//	fmt.Fprintf(w, "NAME\tSIZE\n")
-	//	for walker.Step() {
-	//		if err = walker.Err(); err != nil {
-	//			log.Debugf("%s", err)
-	//			continue
-	//		}
-	//		if walker.Stat().Mode().IsDir() {
-	//			if walker.Path() != "/buffer" {
-	//				fmt.Fprintf(w, "%s/\t\n", walker.Path()[8:])
-	//			}
-	//		} else {
-	//			fmt.Fprintf(w, "%s\t%s\n", walker.Path()[8:], humanize.Bytes(uint64(walker.Stat().Size())))
-	//		}
-	//	}
-	//	w.Flush()
+	if sftpCred, err = client.GetsftpCred(l.Client, archive); err != nil {
+		return
+	}
 
-	return loi, minio.ErrorRespToObjectError(err, archive)
+	fmt.Println("Cred initialized")
+
+	sftpConn, e := client.GetsftpConn(sftpCred)
+	if e != nil {
+		err = e
+		return
+	}
+	defer sftpCred.Close()
+	defer sftpConn.Close()
+
+	if _, _, err = l.Client.FindSafeUUIDFromArchive(archive, true); err != nil {
+		if _, _, err = l.Client.FindSafeUUIDFromArchive(archive, false); err != nil {
+			return
+		}
+	}
+	loi.IsTruncated = false
+	walker := sftpConn.Walk("/buffer")
+	for walker.Step() {
+		if err = walker.Err(); err != nil {
+			log.Debugf("%s", err)
+			continue
+		}
+		if len(walker.Path()) <= 8 {
+			continue
+		}
+		fmt.Println("name : ", walker.Path()[8:])
+		fmt.Println("size : ", humanize.Bytes(uint64(walker.Stat().Size())))
+
+		loi.Objects = append(loi.Objects, minio.ObjectInfo{
+			Bucket: archive,
+			Name:   walker.Path()[8:],
+			Size:   walker.Stat().Size(),
+		})
+	}
+	return
 }
 
 // ListObjectsV2 lists all blobs in S3 bucket filtered by prefix
@@ -363,194 +357,27 @@ func (l *c14Objects) GetObjectInfo(ctx context.Context, bucket string, object st
 func (l *c14Objects) PutObject(ctx context.Context, archive string, object string, data *hash.Reader, metadata map[string]string) (objInfo minio.ObjectInfo, err error) {
 
 	var (
-		safe        api.OnlineGetSafe
-		bucket      api.OnlineGetBucket
-		sftpCred    sshUtils.Credentials
-		sftpConn    *sftp.Client
-		files       []uploadFile
-		uuidArchive string
-		padding     int
+		sftpCred sshUtils.Credentials
+		padding  int
 	)
 
-	if safe, uuidArchive, err = l.Client.FindSafeUUIDFromArchive(archive, true); err != nil {
-		if safe, uuidArchive, err = l.Client.FindSafeUUIDFromArchive(archive, false); err != nil {
-			return
-		}
-	}
-	if bucket, err = l.Client.GetBucket(safe.UUIDRef, uuidArchive); err != nil {
+	if sftpCred, err = client.GetsftpCred(l.Client, archive); err != nil {
 		return
 	}
-	sftpCred.Host = strings.Split(bucket.Credentials[0].URI, "@")[1]
-	sftpCred.Password = bucket.Credentials[0].Password
-	sftpCred.User = bucket.Credentials[0].Login
-	if sftpConn, err = sftpCred.NewSFTPClient(); err != nil {
+
+	sftpConn, e := client.GetsftpConn(sftpCred)
+	if e != nil {
+		err = e
 		return
 	}
 	defer sftpCred.Close()
 	defer sftpConn.Close()
 
-	var (
-		f    *os.File
-		info os.FileInfo
-	)
-
-	if f, err = os.Open(object); err != nil {
-		log.Warnf("Open %s: %s", object, err)
-	}
-	if info, err = f.Stat(); err != nil {
-		log.Warnf("Stat %s: %s", object, err)
-		f.Close()
-	}
-	switch mode := info.Mode(); {
-	case mode.IsDir():
-		walker := fs.Walk(object)
-		for walker.Step() {
-			if err = walker.Err(); err != nil {
-				log.Warnf("Walker %s: %s", walker.Path(), err)
-				f.Close()
-				continue
-			}
-			name := walker.Path()
-			for name[0] == '/' {
-				name = name[1:]
-			}
-			if walker.Stat().Mode().IsDir() {
-				if err = sftpConn.Mkdir("/buffer/" + name); err != nil {
-					if err.Error() == "file does not exist" { // bad :/
-						sp := strings.Split(name, string(os.PathSeparator))
-						path := sp[0]
-						for i, n := range sp {
-							if i != 0 {
-								path = path + "/" + n
-							}
-							sftpConn.Mkdir("/buffer/" + path)
-						}
-					}
-					continue
-				}
-				f.Close()
-			} else if walker.Stat().Mode().IsRegular() {
-				if len(name) > padding {
-					padding = len(name)
-				}
-				files = append(files, uploadFile{
-					FileFD: f,
-					Info:   info,
-					Name:   name,
-					Path:   walker.Path(),
-				})
-			}
-		}
-	case mode.IsRegular():
-		name := filepath.Base(object)
-		if len(name) > padding {
-			padding = len(name)
-		}
-		files = append(files, uploadFile{
-			FileFD: f,
-			Info:   info,
-			Name:   name,
-			Path:   object,
-		})
-	}
-	for _, file := range files {
-		var (
-			info   os.FileInfo
-			reader *os.File
-		)
-
-		if reader, err = os.Open(file.Path); err != nil {
-			reader.Close()
-			file.FileFD.Close()
-			log.Warnf("reader Open %s: %s", file.Path, err)
-			continue
-		}
-		if info, err = reader.Stat(); err != nil {
-			reader.Close()
-			file.FileFD.Close()
-			log.Warnf("reader Stat %s: %s", file.Path, err)
-			continue
-		}
-		if err = l.uploadAFile(sftpConn, reader, object, info.Size(), padding); err != nil {
-			log.Warnf("upload %s: %s", file.Path, err)
-		}
-		file.FileFD.Close()
-		reader.Close()
+	if err = client.UploadAFile(sftpConn, data, object, data.Size(), padding); err != nil {
+		log.Warnf("upload %s: %s", object, err)
 	}
 	err = nil
 	return
-}
-
-func (u *c14Objects) uploadAFile(c *sftp.Client, reader io.ReadCloser, file string, size int64, padding int) (err error) {
-	log.Debugf("Upload %s -> /buffer/%s", file, file)
-
-	var (
-		buff   = make([]byte, 1<<23)
-		nr, nw int
-		w      *sftp.File
-	)
-	if w, err = c.Create(fmt.Sprintf("/buffer/%s", file)); err != nil {
-		return
-	}
-	defer w.Close()
-	if size == 0 {
-		log.Warnf("upload %s is empty", file)
-		return
-	}
-	sf := streamformatter.NewStreamFormatter()
-	progressBarOutput := sf.NewProgressOutput(os.Stdout, true)
-	rc := progress.NewProgressReader(reader, progressBarOutput, size, "", fmt.Sprintf("%-*s", padding, file))
-	defer rc.Close()
-	for {
-		nr, err = rc.Read(buff)
-		if err != nil {
-			if err == io.EOF {
-				err = nil
-			}
-			break
-		}
-		if nw, err = w.Write(buff[:nr]); err != nil {
-			return
-		}
-		if nw != nr {
-			err = errors.Errorf("Error during write")
-			return
-		}
-	}
-	return
-}
-
-func (u *c14Objects) pipedUpload(c *sftp.Client, archive string) (err error) {
-	var (
-		buff   = make([]byte, 1<<23)
-		nr, nw int
-		total  uint64
-		w      *sftp.File
-	)
-
-	if w, err = c.Create(fmt.Sprintf("/buffer/%s", archive)); err != nil {
-		return
-	}
-	for {
-		nr, err = os.Stdin.Read(buff)
-		if err != nil {
-			if err == io.EOF {
-				err = nil
-			}
-			break
-		}
-		if nw, err = w.Write(buff[:nr]); err != nil {
-			return
-		}
-		if nw != nr {
-			err = errors.Errorf("Error during write")
-			return
-		}
-		total += uint64(nr)
-		fmt.Printf("\rUploading \t%s", humanize.Bytes(total))
-
-	}
-	return nil
 }
 
 // CopyObject copies an object from source bucket to a destination bucket.
